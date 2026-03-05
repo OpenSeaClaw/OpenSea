@@ -1,8 +1,7 @@
 {
 	"providers": {
 		"z.ai": [
-			"z1",
-			"z1-mini"
+			"glm-5"
 		],
 		"openai": [
 			"gpt-4o",

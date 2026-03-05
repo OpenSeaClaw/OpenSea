@@ -61,7 +61,7 @@ python3 scripts/search.py --query "I need a lightweight MacBook for coding under
 | Variable | Required | Description |
 |---|---|---|
 | `ZAI_API_KEY` | **Yes** | z.ai API key for chat completions |
-| `ZAI_API_ENDPOINT` | No | Override API base URL (default: `https://api.z.ai/v1`) |
+| `ZAI_API_ENDPOINT` | No | Override API base URL (default: `https://api.z.ai/api/paas/v4`) |
 | `OPENCLAW_WORKSPACE` | No | Override workspace root for skill install target |
 
 ---

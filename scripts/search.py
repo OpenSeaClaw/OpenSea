@@ -206,8 +206,8 @@ class ZAIClient:
     from the gathered context.  Returns a structured list of recommendations.
     """
 
-    DEFAULT_BASE = "https://api.z.ai/v1"
-    DEFAULT_MODEL = "z1"
+    DEFAULT_BASE = "https://api.z.ai/api/paas/v4"
+    DEFAULT_MODEL = "glm-5"
 
     # System prompt sent to the model – instructs it to return valid JSON
     SYSTEM_PROMPT = textwrap.dedent("""\
@@ -291,6 +291,7 @@ class ZAIClient:
         """
         url = f"{self.base_url}/chat/completions"
         headers = {
+            "Accept-Language": "en-US,en",
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
@@ -300,6 +301,7 @@ class ZAIClient:
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": self.build_user_message(context)},
             ],
+            "stream": True,
             "temperature": 0.3,   # Low temperature for factual, consistent results
             "max_tokens": 4096,
         }
