@@ -2,8 +2,8 @@
 """
 OpenSea – Core Execution Script
 ================================
-Drives a 5-question questionnaire, calls the z.ai API, and formats
-3-5 personalised product recommendations in strict Markdown.
+Routes users through category-aware intake, calls the z.ai API, and
+formats 3-5 personalised product recommendations in strict Markdown.
 
 Usage:
     python3 search.py                          # fully interactive
@@ -11,7 +11,7 @@ Usage:
     python3 search.py --save-key <your_zai_key>
 
 Architecture:
-    StateManager          – parses initial prompt; sequential Q&A state machine
+    StateManager          – parses initial prompt; category-aware Q&A state machine
     ZAIClient             – builds payload, calls z.ai API, parses JSON response
     RecommendationFormatter – renders star ratings + supplier links in Markdown
 """
@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import textwrap
 from pathlib import Path
@@ -73,50 +74,112 @@ def _load_config() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 class StateManager:
     """
-    Manages the sequential questionnaire needed to gather product context.
+    Manages category-aware intake.
 
-    Questions (asked only when not already known from the initial prompt):
-        Q1 – product / what they're looking for
-        Q2 – preferred operating system
-        Q3 – primary use case
-        Q4 – most important factors  ← drives star-rating selection
-        Q5 – approximate budget
+    Laptops, phones, and cars use multi-question intake.
+    Other product types use a single fallback prompt.
     """
 
-    QUESTIONS: list[tuple[str, str]] = [
-        (
-            "product",
-            "What are you looking for today?",
-        ),
-        (
-            "os",
-            "Which operating system do you prefer? (e.g., macOS, Windows, Linux, No preference)",
-        ),
-        (
-            "use_case",
-            "What do you mainly use the laptop for? (e.g., coding, video editing, gaming, general use)",
-        ),
-        (
-            "factors",
-            "What are the most important factors to you? "
-            "(e.g., Processing speed, Display quality, Weight, Battery life)",
-        ),
-        (
-            "budget",
-            "What is your approximate budget? (e.g., £500, £1000, £1500)",
-        ),
-    ]
+    CATEGORY_QUESTIONS: dict[str, list[tuple[str, str]]] = {
+        "laptop": [
+            (
+                "product",
+                "What are you looking for today?",
+            ),
+            (
+                "os",
+                "Which operating system do you prefer?",
+            ),
+            (
+                "use_case",
+                "What do you mainly use the laptop for?",
+            ),
+            (
+                "factors",
+                "What are the most important factors to you? "
+                "(e.g. Processing speed, display quality, weight, battery life)",
+            ),
+            (
+                "budget",
+                "What is your approximate budget? (e.g. £500, £1000)",
+            ),
+        ],
+        "phone": [
+            (
+                "product",
+                "What phone are you looking for today?",
+            ),
+            (
+                "os",
+                "Which phone operating system do you prefer?",
+            ),
+            (
+                "use_case",
+                "What do you mainly use the phone for?",
+            ),
+            (
+                "factors",
+                "What are the most important factors to you? "
+                "(e.g. Camera quality, battery life, performance, screen size)",
+            ),
+            (
+                "budget",
+                "What is your approximate budget? (e.g. £300, £800)",
+            ),
+        ],
+        "car": [
+            (
+                "product",
+                "What car are you looking for today?",
+            ),
+            (
+                "fuel_type",
+                "Which fuel type do you prefer? (e.g. Petrol, diesel, hybrid, electric)",
+            ),
+            (
+                "use_case",
+                "What do you mainly use the car for?",
+            ),
+            (
+                "factors",
+                "What are the most important factors to you? "
+                "(e.g. Reliability, fuel economy, safety, boot space)",
+            ),
+            (
+                "budget",
+                "What is your approximate budget? (e.g. £5000, £15000)",
+            ),
+        ],
+    }
+    GENERAL_OPENING_QUESTION: tuple[str, str] = (
+        "general_request",
+        "What product are you looking for, what matters most, and what is your budget?",
+    )
+
+    CATEGORY_KEYWORDS: dict[str, list[str]] = {
+        "laptop": ["laptop", "macbook", "notebook", "pc", "computer", "chromebook"],
+        "phone": ["phone", "iphone", "android", "smartphone", "mobile", "pixel", "galaxy"],
+        "car": ["car", "vehicle", "suv", "sedan", "hatchback", "truck", "ev", "hybrid"],
+    }
 
     # Simple keyword heuristics to extract answers from a free-text prompt
     _OS_KEYWORDS: list[str] = ["macos", "mac os", "windows", "linux", "chromeos", "chrome os"]
-    _BUDGET_PATTERNS: list[str] = ["£", "$", "€", "usd", "gbp", "eur", "budget", "spend", "price"]
     _FACTOR_KEYWORDS: list[str] = [
         "speed", "performance", "display", "screen", "weight", "portable",
         "battery", "storage", "ram", "memory", "build", "design", "keyboard",
+        "camera", "range", "reliability", "economy", "safety", "space", "comfort",
     ]
+    _USE_CASE_KEYWORDS: list[str] = [
+        "coding", "programming", "development", "video editing", "editing",
+        "gaming", "general use", "school", "study", "work", "office",
+        "design", "3d", "streaming", "browsing", "photography", "commuting",
+        "family", "road trips", "daily driving",
+    ]
+    _FUEL_KEYWORDS: list[str] = ["petrol", "diesel", "hybrid", "electric"]
 
     def __init__(self, initial_prompt: str = "") -> None:
         self.context: dict[str, str] = {}
+        self.category = "other"
         if initial_prompt.strip():
             self._parse_initial_prompt(initial_prompt)
 
@@ -129,10 +192,13 @@ class StateManager:
         Any field successfully detected is stored so its question is skipped.
         """
         lower = prompt.lower()
+        self.category = self._detect_category(lower)
+        self.context["category"] = self.category
 
-        # product – if prompt mentions laptop / device type, treat as Q1 answered
-        product_hints = ["laptop", "macbook", "notebook", "pc", "computer",
-                         "tablet", "chromebook", "looking for", "need a", "want a"]
+        # product – if prompt mentions a device/product type, treat as answered
+        product_hints = ["laptop", "macbook", "notebook", "pc", "computer", "tablet",
+                         "chromebook", "phone", "iphone", "android", "car", "vehicle",
+                         "looking for", "need a", "want a", "buy"]
         if any(h in lower for h in product_hints):
             self.context["product"] = prompt.strip()
 
@@ -143,7 +209,6 @@ class StateManager:
                 break
 
         # budget – extract any mention of a currency value
-        import re
         budget_match = re.search(
             r"[£$€][\s]?\d[\d,]*(?:\.\d+)?|\b\d[\d,]*(?:\.\d+)?\s*(?:gbp|usd|eur|pounds?|dollars?)",
             lower,
@@ -156,6 +221,26 @@ class StateManager:
         if found_factors:
             self.context["factors"] = ", ".join(found_factors)
 
+        # use_case – store the full prompt if it clearly states how the device will be used
+        if any(kw in lower for kw in self._USE_CASE_KEYWORDS):
+            self.context["use_case"] = prompt.strip()
+
+        # fuel_type for cars
+        for kw in self._FUEL_KEYWORDS:
+            if kw in lower:
+                self.context["fuel_type"] = kw.title()
+                break
+
+        if self.category == "other":
+            self.context["general_request"] = prompt.strip()
+
+    def _detect_category(self, lower_prompt: str) -> str:
+        """Infer product category from the initial prompt."""
+        for category, keywords in self.CATEGORY_KEYWORDS.items():
+            if any(keyword in lower_prompt for keyword in keywords):
+                return category
+        return "other"
+
     # ------------------------------------------------------------------
     # Interactive questionnaire
     # ------------------------------------------------------------------
@@ -167,7 +252,21 @@ class StateManager:
         print()  # blank line for readability
         any_asked = False
 
-        for field, question in self.QUESTIONS:
+        if "product" not in self.context and "general_request" not in self.context:
+            answer = self._ask("What are you looking for today?")
+            self.context["product"] = answer
+            inferred_category = self._detect_category(answer.lower())
+            self.category = inferred_category
+            self.context["category"] = inferred_category
+            if inferred_category == "other":
+                self.context["general_request"] = answer
+            any_asked = True
+
+        questions = self.CATEGORY_QUESTIONS.get(self.category)
+        if questions is None:
+            questions = [self.GENERAL_OPENING_QUESTION]
+
+        for field, question in questions:
             if field in self.context:
                 # Already known – skip silently
                 continue
@@ -179,6 +278,9 @@ class StateManager:
 
         if not any_asked:
             print("[OpenSea] All details gathered from your prompt. Searching now...\n")
+
+        if self.category in self.CATEGORY_QUESTIONS and "product" not in self.context:
+            self.context["product"] = self.category
 
         return self.context
 
@@ -211,9 +313,9 @@ class ZAIClient:
 
     # System prompt sent to the model – instructs it to return valid JSON
     SYSTEM_PROMPT = textwrap.dedent("""\
-        You are an expert tech-product advisor specialising in laptops and
-        personal computers. The user will describe what they need; your job is
-        to return 3 to 5 highly relevant product recommendations.
+        You are an expert buying advisor. The user will describe what they
+        need; your job is to return 3 to 5 highly relevant product
+        recommendations for the requested category.
 
         You MUST respond with ONLY a valid JSON object in exactly this schema
         (no markdown fences, no extra text):
@@ -222,12 +324,19 @@ class ZAIClient:
           "recommendations": [
             {
               "name": "<Full product name including model year if known>",
-              "os": "<macOS | Windows | Linux | Chrome OS>",
-              "description": "<2-3 sentences: why this product suits the user's needs>",
+              "os": "<OS/platform/fuel type when relevant, otherwise empty string>",
+              "description": "<Exactly one sentence: why this product suits the user's needs>",
               "criteria_ratings": {
                 "<factor name>": <integer 1-5>,
                 ...
               },
+              "reddit_reviews": [
+                {
+                  "sentiment": "<positive | mixed | negative>",
+                  "quote": "<Short Reddit quote about the product>",
+                  "url": "<Full Reddit discussion URL>"
+                }
+              ],
               "suppliers": [
                 {
                   "name": "<Retailer name>",
@@ -243,8 +352,10 @@ class ZAIClient:
         Rules:
         - criteria_ratings keys must exactly match the user's stated factors (lower-case).
         - Ratings are integers 1 (worst) to 5 (best) for that criterion.
+        - description must be exactly one sentence.
+        - Include 1 or 2 reddit_reviews per product with short, realistic quotes and real Reddit URLs.
         - Include at least 2 suppliers per product, listing the cheapest options first.
-        - Use real, plausible UK retailers (Currys, Amazon UK, John Lewis, eBay, etc.).
+        - Use real, plausible UK retailers, dealers, or marketplaces appropriate to the category.
         - All prices must be in the currency implied by the user's budget.
         - Never invent URLs — use realistic, well-formed URLs for each retailer.
         - Descriptions must be grounded in actual product specs.
@@ -267,10 +378,23 @@ class ZAIClient:
         Convert the collected context dict into a clear natural-language
         message for the model.
         """
+        if context.get("category") == "other":
+            general_request = context.get("general_request", context.get("product", "Not specified"))
+            lines = [
+                "The user is looking for product recommendations in a category outside the standard guided flows.",
+                f"- Request: {general_request}",
+            ]
+            lines.append(
+                "\nPlease provide 3 to 5 personalised product recommendations in the exact JSON schema specified."
+            )
+            return "\n".join(lines)
+
         lines = ["The user is looking for product recommendations with the following details:"]
         field_labels = {
+            "category": "Category",
             "product": "Looking for",
             "os": "Preferred OS",
+            "fuel_type": "Preferred fuel type",
             "use_case": "Primary use case",
             "factors": "Most important factors",
             "budget": "Approximate budget",
@@ -301,7 +425,7 @@ class ZAIClient:
                 {"role": "system", "content": self.SYSTEM_PROMPT},
                 {"role": "user", "content": self.build_user_message(context)},
             ],
-            "stream": True,
+            "stream": False,
             "temperature": 0.3,   # Low temperature for factual, consistent results
             "max_tokens": 4096,
         }
@@ -386,6 +510,11 @@ class RecommendationFormatter:
     """
 
     STAR = "⭐️"
+    REVIEW_EMOJI = {
+        "positive": "😃",
+        "mixed": "😕",
+        "negative": "😕",
+    }
 
     def __init__(self, factors_answer: str) -> None:
         """
@@ -421,6 +550,25 @@ class RecommendationFormatter:
                 return req
         return None
 
+    def _format_reddit_reviews(self, reviews: list[dict[str, Any]]) -> list[str]:
+        """Render Reddit review snippets as linked quotes."""
+        if not reviews:
+            return []
+
+        lines = ["", "Reviews from Reddit:"]
+        for review in reviews[:2]:
+            sentiment = str(review.get("sentiment", "mixed")).strip().lower()
+            emoji = self.REVIEW_EMOJI.get(sentiment, "😕")
+            quote = str(review.get("quote", "")).strip()
+            url = str(review.get("url", "")).strip()
+            if not quote:
+                continue
+            if url:
+                lines.append(f'- {emoji}: ["{quote}"]({url})')
+            else:
+                lines.append(f'- {emoji}: "{quote}"')
+        return lines if len(lines) > 2 else []
+
     def format(
         self,
         recommendations: list[dict[str, Any]],
@@ -433,12 +581,14 @@ class RecommendationFormatter:
             return "_No recommendations were returned. Please try again with different criteria._"
 
         lines: list[str] = ["Your personalised recommendations:\n"]
+        attribute_label = self._attribute_label(context.get("category", "other"))
 
         for idx, rec in enumerate(recommendations):
             name = rec.get("name", f"Product {idx + 1}")
             os_label = rec.get("os", "")
             description = rec.get("description", "")
             criteria_ratings: dict = rec.get("criteria_ratings", {})
+            reddit_reviews: list[dict] = rec.get("reddit_reviews", [])
             suppliers: list[dict] = rec.get("suppliers", [])
 
             # Product heading
@@ -446,7 +596,7 @@ class RecommendationFormatter:
 
             # OS line always shown
             if os_label:
-                lines.append(f"- Operating System: {os_label}")
+                lines.append(f"- {attribute_label}: {os_label}")
 
             # Star ratings – ONLY for factors the user requested
             matched_any = False
@@ -467,6 +617,8 @@ class RecommendationFormatter:
             # Description in italics
             if description:
                 lines.append(f"\n*{description}*")
+
+            lines.extend(self._format_reddit_reviews(reddit_reviews))
 
             # Suppliers
             if suppliers:
@@ -489,7 +641,19 @@ class RecommendationFormatter:
 
             lines.append("")  # blank line between entries
 
+        lines.append("Please let me know how well these recommendations fit your needs! 🤓")
         return "\n".join(lines)
+
+    @staticmethod
+    def _attribute_label(category: str) -> str:
+        """Pick the most natural secondary attribute label for the category."""
+        if category == "car":
+            return "Fuel Type"
+        if category == "phone":
+            return "Operating System"
+        if category == "laptop":
+            return "Operating System"
+        return "Platform"
 
 
 # ---------------------------------------------------------------------------
