@@ -1,0 +1,8 @@
+{
+  "max_recommendations": 5,
+  "min_recommendations": 3,
+  "currency": "GBP",
+  "request_timeout_seconds": 30,
+  "zai_api_base": "https://api.z.ai/v1",
+  "zai_model": "z1"
+}
