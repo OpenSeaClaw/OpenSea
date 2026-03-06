@@ -1,7 +1,7 @@
 # OpenSea
 
 OpenSea is an OpenClaw-ready skill that gives users **personalised laptop and
-tech-product recommendations** powered by the [z.ai](https://z.ai) API.
+tech-product recommendations** powered by the [flock.io](https://flock.io) API.
 
 ---
 
@@ -9,7 +9,7 @@ tech-product recommendations** powered by the [z.ai](https://z.ai) API.
 
 - **Smart questionnaire** – asks only the questions not already answered in the
   user's prompt (OS, use-case, important factors, budget).
-- **z.ai integration** – uses the z.ai chat-completion API to surface 3–5
+- **flock.io integration** – uses the flock.io chat-completion API to surface 3–5
   highly relevant recommendations with real supplier pricing.
 - **Strict Markdown output** – star ratings shown only for the criteria the
   user actually cares about; supplier links included per product.
@@ -36,12 +36,12 @@ bash install/install-skill.sh
 bash install/verify-skill-install.sh
 ```
 
-### Set your z.ai API Key
+### Set your flock.io API Key
 
 ```bash
-export ZAI_API_KEY="your_zai_api_key_here"
+export FLOCK_API_KEY="your_flock_api_key_here"
 # Or let the script save it for you:
-python3 scripts/search.py --save-key "your_zai_api_key_here"
+python3 scripts/search.py --save-key "your_flock_api_key_here"
 ```
 
 ### Run a search
@@ -60,8 +60,8 @@ python3 scripts/search.py --query "I need a lightweight MacBook for coding under
 
 | Variable | Required | Description |
 |---|---|---|
-| `ZAI_API_KEY` | **Yes** | z.ai API key for chat completions |
-| `ZAI_API_ENDPOINT` | No | Override API base URL (default: `https://api.z.ai/api/paas/v4`) |
+| `FLOCK_API_KEY` | **Yes** | flock.io API key for chat completions |
+| `FLOCK_API_ENDPOINT` | No | Override API base URL (default: `https://api.flock.io/v1`) |
 | `OPENCLAW_WORKSPACE` | No | Override workspace root for skill install target |
 
 ---
@@ -75,7 +75,7 @@ OpenSea/
 ├── requirements.txt             # Python dependencies
 ├── config/
 │   ├── defaults.json            # Tunable defaults (timeouts, result counts)
-│   └── providers.json           # z.ai model whitelist
+│   └── providers.json           # flock.io model whitelist
 ├── install/
 │   ├── install.sh               # Bootstrap: chmod + runtime dir
 │   ├── verify.sh                # Dependency check

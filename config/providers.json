@@ -1,7 +1,7 @@
 {
 	"providers": {
-		"z.ai": [
-			"glm-5"
+		"flock.io": [
+			"qwen3-30b-a3b-instruct-2507"
 		],
 		"openai": [
 			"gpt-4o",

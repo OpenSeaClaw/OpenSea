@@ -47,15 +47,15 @@ else
 fi
 
 echo ""
-echo "Checking z.ai API key..."
+echo "Checking flock.io API key..."
 # Check env var first, then runtime/.env
-if [[ -n "${ZAI_API_KEY:-}" ]]; then
-  echo "[OK] ZAI_API_KEY is set (env var)"
-elif [[ -f "$ROOT_DIR/runtime/.env" ]] && grep -q "ZAI_API_KEY" "$ROOT_DIR/runtime/.env" 2>/dev/null; then
-  echo "[OK] ZAI_API_KEY found in runtime/.env"
+if [[ -n "${FLOCK_API_KEY:-}" ]]; then
+  echo "[OK] FLOCK_API_KEY is set (env var)"
+elif [[ -f "$ROOT_DIR/runtime/.env" ]] && grep -q "FLOCK_API_KEY" "$ROOT_DIR/runtime/.env" 2>/dev/null; then
+  echo "[OK] FLOCK_API_KEY found in runtime/.env"
 else
-  echo "[WARN] ZAI_API_KEY is not set — required for z.ai API calls"
-  echo "       Set via: export ZAI_API_KEY=<key>"
+  echo "[WARN] FLOCK_API_KEY is not set — required for flock.io API calls"
+  echo "       Set via: export FLOCK_API_KEY=<key>"
   echo "       Or run:  python3 scripts/search.py --save-key <key>"
 fi
 
