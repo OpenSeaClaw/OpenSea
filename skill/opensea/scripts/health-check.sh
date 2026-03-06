@@ -34,11 +34,17 @@ for f in "$SKILL_DIR/config/defaults.json" "$SKILL_DIR/config/providers.json" "$
 done
 
 echo ""
-echo "Checking z.ai API key..."
+echo "Checking provider API keys..."
 if [[ -n "${ZAI_API_KEY:-}" ]]; then
   echo "[OK] ZAI_API_KEY is set (env var)"
 else
-  echo "[WARN] ZAI_API_KEY is not set — required for z.ai API calls"
+  echo "[WARN] ZAI_API_KEY is not set"
+fi
+
+if [[ -n "${FLOCK_API_KEY:-}" ]]; then
+  echo "[OK] FLOCK_API_KEY is set (env var)"
+else
+  echo "[WARN] FLOCK_API_KEY is not set"
 fi
 
 echo ""

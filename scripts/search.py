@@ -2,17 +2,18 @@
 """
 OpenSea – Core Execution Script
 ================================
-Routes users through category-aware intake, calls the z.ai API, and
+Routes users through category-aware intake, calls the selected provider API, and
 formats 3-5 personalised product recommendations in strict Markdown.
 
 Usage:
     python3 search.py                          # fully interactive
     python3 search.py --query "MacBook, coding, £1200"
-    python3 search.py --save-key <your_zai_key>
+    python3 search.py --provider z.ai --save-key <your_zai_key>
+    python3 search.py --provider flock.io --save-key <your_flock_key>
 
 Architecture:
     StateManager          – parses initial prompt; category-aware Q&A state machine
-    ZAIClient             – builds payload, calls z.ai API, parses JSON response
+    ProviderClient        – builds payload, calls the selected API, parses JSON response
     RecommendationFormatter – renders star ratings + supplier links in Markdown
 """
 
@@ -57,10 +58,11 @@ CONFIG_CANDIDATES = [
     ROOT_DIR.parent / "config" / "defaults.json",
     ROOT_DIR.parent / "skills" / "opensea" / "config" / "defaults.json",
 ]
+PROVIDERS_FILE = ROOT_DIR / "config" / "providers.json"
 
 
 def _load_env() -> None:
-    """Load ZAI_API_KEY from runtime/.env if not already in environment."""
+    """Load saved provider environment values from runtime/.env."""
     if load_dotenv is not None and ENV_FILE.exists():
         load_dotenv(ENV_FILE, override=False)
 
@@ -76,6 +78,18 @@ def _load_config() -> dict[str, Any]:
         except json.JSONDecodeError:
             continue
     return {}
+
+
+def _load_providers() -> dict[str, list[str]]:
+    """Read providers.json; return an empty mapping on failure."""
+    try:
+        with open(PROVIDERS_FILE) as fh:
+            data = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {}
+
+    providers = data.get("providers", {})
+    return providers if isinstance(providers, dict) else {}
 
 
 # ---------------------------------------------------------------------------
@@ -309,16 +323,31 @@ class StateManager:
 
 
 # ---------------------------------------------------------------------------
-# 2. ZAIClient – z.ai API integration
+# 2. ProviderClient – provider-specific API integration
 # ---------------------------------------------------------------------------
-class ZAIClient:
+class ProviderClient:
     """
-    Calls the z.ai chat-completion endpoint with a structured prompt built
+    Calls the selected chat-completion endpoint with a structured prompt built
     from the gathered context.  Returns a structured list of recommendations.
     """
 
-    DEFAULT_BASE = "https://api.z.ai/api/paas/v4"
-    DEFAULT_MODEL = "glm-5"
+    PROVIDERS: dict[str, dict[str, str]] = {
+        "z.ai": {
+            "api_key_env": "ZAI_API_KEY",
+            "base_env": "ZAI_API_ENDPOINT",
+            "default_base": "https://api.z.ai/api/paas/v4",
+            "default_model": "glm-5",
+            "success_label": "z.ai",
+        },
+        "flock.io": {
+            "api_key_env": "FLOCK_API_KEY",
+            "base_env": "FLOCK_API_ENDPOINT",
+            "default_base": "https://api.flock.io/v1",
+            "default_model": "qwen3-30b-a3b-instruct-2507",
+            "success_label": "flock.io",
+        },
+    }
+
     DEFAULT_TIMEOUT = 90
     DEFAULT_RETRY_TIMEOUT = 140
     DEFAULT_MAX_TOKENS = 4096
@@ -386,14 +415,19 @@ class ZAIClient:
 
     def __init__(
         self,
+        provider: str,
         api_key: str,
-        base_url: str = DEFAULT_BASE,
-        model: str = DEFAULT_MODEL,
+        base_url: str,
+        model: str,
         timeout: int = DEFAULT_TIMEOUT,
         retry_timeout: int = DEFAULT_RETRY_TIMEOUT,
         max_tokens: int = DEFAULT_MAX_TOKENS,
         compact_max_tokens: int = DEFAULT_COMPACT_MAX_TOKENS,
     ) -> None:
+        if provider not in self.PROVIDERS:
+            raise ValueError(f"Unsupported provider: {provider}")
+        self.provider = provider
+        self.provider_meta = self.PROVIDERS[provider]
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
@@ -452,6 +486,20 @@ class ZAIClient:
             "max_tokens": token_budget,
         }
 
+    def _build_headers(self) -> dict[str, str]:
+        """Build provider-specific request headers."""
+        if self.provider == "flock.io":
+            return {
+                "accept": "application/json",
+                "Content-Type": "application/json",
+                "x-litellm-api-key": self.api_key,
+            }
+        return {
+            "Accept-Language": "en-US,en",
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
     def _request_completion(
         self,
         user_message: str,
@@ -461,36 +509,32 @@ class ZAIClient:
     ) -> tuple[str, str]:
         """Send one completion request and return content plus finish reason."""
         url = f"{self.base_url}/chat/completions"
-        headers = {
-            "Accept-Language": "en-US,en",
-            "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._build_headers()
         payload = self._build_payload(user_message, compact_mode=compact_mode)
 
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
         except requests.exceptions.Timeout as exc:
             raise TimeoutError(
-                f"[ERROR] Request to z.ai timed out after {timeout}s. "
+                f"[ERROR] Request to {self.provider} timed out after {timeout}s. "
                 "Check your internet connection or increase request_timeout_seconds in config/defaults.json."
             ) from exc
         except requests.exceptions.ConnectionError as exc:
-            raise RuntimeError(f"[ERROR] Could not connect to z.ai API: {exc}")
+            raise RuntimeError(f"[ERROR] Could not connect to {self.provider} API: {exc}")
 
         if resp.status_code == 401:
             raise RuntimeError(
-                "[ERROR] z.ai API returned 401 Unauthorized. "
-                "Check your ZAI_API_KEY is correct and has not expired."
+                f"[ERROR] {self.provider} API returned 401 Unauthorized. "
+                f"Check your {self.provider_meta['api_key_env']} is correct and has not expired."
             )
         if resp.status_code == 429:
             raise RuntimeError(
-                "[ERROR] z.ai API rate limit exceeded (429). "
+                f"[ERROR] {self.provider} API rate limit exceeded (429). "
                 "Please wait a moment and try again."
             )
         if not resp.ok:
             raise RuntimeError(
-                f"[ERROR] z.ai API returned HTTP {resp.status_code}: {resp.text[:300]}"
+                f"[ERROR] {self.provider} API returned HTTP {resp.status_code}: {resp.text[:300]}"
             )
 
         try:
@@ -500,7 +544,7 @@ class ZAIClient:
             finish_reason = str(choice.get("finish_reason", "")).strip().lower()
         except (KeyError, IndexError, AttributeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
-                f"[ERROR] Unexpected z.ai response structure: {exc}\n"
+                f"[ERROR] Unexpected {self.provider} response structure: {exc}\n"
                 f"Raw response: {resp.text[:500]}"
             )
         return content, finish_reason
@@ -769,56 +813,132 @@ class RecommendationFormatter:
 
 
 # ---------------------------------------------------------------------------
-# Key management helpers
+# Provider and key management helpers
 # ---------------------------------------------------------------------------
-def save_api_key(key: str) -> None:
-    """Persist ZAI_API_KEY to runtime/.env without printing the key value."""
+def _normalise_provider(value: str) -> str:
+    """Map user input to a supported provider name."""
+    raw = value.strip().lower()
+    aliases = {
+        "z.ai": "z.ai",
+        "zai": "z.ai",
+        "z-ai": "z.ai",
+        "flock.io": "flock.io",
+        "flock": "flock.io",
+    }
+    return aliases.get(raw, "")
+
+
+def resolve_provider(cli_provider: str = "") -> str:
+    """
+    Resolve which provider to use.
+    Priority:
+      1. CLI argument
+      2. OPENSEA_PROVIDER environment variable
+      3. Interactive prompt
+    """
+    _load_env()
+
+    if cli_provider:
+        provider = _normalise_provider(cli_provider)
+        if provider:
+            return provider
+        sys.exit("[ERROR] Unsupported provider. Choose z.ai or flock.io.")
+
+    env_provider = _normalise_provider(os.environ.get("OPENSEA_PROVIDER", ""))
+    if env_provider:
+        return env_provider
+
+    while True:
+        try:
+            answer = input("[OpenSea] Which provider would you like to use? (z.ai/flock.io)\n> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n[OpenSea] Provider selection cancelled.")
+            sys.exit(1)
+
+        provider = _normalise_provider(answer)
+        if provider:
+            return provider
+        print("[OpenSea] Please choose either z.ai or flock.io.\n")
+
+
+def _provider_env_key(provider: str) -> str:
+    """Return the provider-specific API key env var name."""
+    return ProviderClient.PROVIDERS[provider]["api_key_env"]
+
+
+def _provider_label(provider: str) -> str:
+    """Return a display label for provider prompts."""
+    return ProviderClient.PROVIDERS[provider]["success_label"]
+
+
+def save_provider(provider: str) -> None:
+    """Persist the preferred provider to runtime/.env."""
     env_dir = ROOT_DIR / "runtime"
     env_dir.mkdir(parents=True, exist_ok=True)
 
     if set_key is not None:
-        set_key(str(ENV_FILE), "ZAI_API_KEY", key)
-        print(f"ZAI_API_KEY received ✓  (saved to {ENV_FILE.relative_to(ROOT_DIR)})")
+        set_key(str(ENV_FILE), "OPENSEA_PROVIDER", provider)
     else:
-        # Fallback: write manually
         existing = ENV_FILE.read_text() if ENV_FILE.exists() else ""
-        if "ZAI_API_KEY" in existing:
-            # Replace existing line
+        if "OPENSEA_PROVIDER" in existing:
             new_lines = [
-                f"ZAI_API_KEY={key}\n" if line.startswith("ZAI_API_KEY=") else line
+                f"OPENSEA_PROVIDER={provider}\n" if line.startswith("OPENSEA_PROVIDER=") else line
                 for line in existing.splitlines(keepends=True)
             ]
             ENV_FILE.write_text("".join(new_lines))
         else:
             with open(ENV_FILE, "a") as fh:
-                fh.write(f"ZAI_API_KEY={key}\n")
-        print(f"ZAI_API_KEY received ✓  (saved to {ENV_FILE.relative_to(ROOT_DIR)})")
+                fh.write(f"OPENSEA_PROVIDER={provider}\n")
 
 
-def resolve_api_key() -> str:
+def save_api_key(provider: str, key: str) -> None:
+    """Persist the provider-specific API key to runtime/.env without printing it."""
+    env_dir = ROOT_DIR / "runtime"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    env_key = _provider_env_key(provider)
+
+    if set_key is not None:
+        set_key(str(ENV_FILE), env_key, key)
+        save_provider(provider)
+        print(f"{env_key} received ✓  (saved to {ENV_FILE.relative_to(ROOT_DIR)})")
+    else:
+        existing = ENV_FILE.read_text() if ENV_FILE.exists() else ""
+        if env_key in existing:
+            new_lines = [
+                f"{env_key}={key}\n" if line.startswith(f"{env_key}=") else line
+                for line in existing.splitlines(keepends=True)
+            ]
+            ENV_FILE.write_text("".join(new_lines))
+        else:
+            with open(ENV_FILE, "a") as fh:
+                fh.write(f"{env_key}={key}\n")
+        save_provider(provider)
+        print(f"{env_key} received ✓  (saved to {ENV_FILE.relative_to(ROOT_DIR)})")
+
+
+def resolve_api_key(provider: str) -> str:
     """
-    Resolve the ZAI_API_KEY from (in priority order):
-      1. ZAI_API_KEY environment variable
-      2. runtime/.env file
-      3. Interactive prompt to the user
+    Resolve the provider-specific API key from environment or prompt.
     Never prints the key value.
     """
     _load_env()
-    key = os.environ.get("ZAI_API_KEY", "").strip()
+    env_key = _provider_env_key(provider)
+    provider_label = _provider_label(provider)
+    key = os.environ.get(env_key, "").strip()
 
     if not key:
-        print("Please provide your z.ai API Key to continue.")
+        print(f"Please provide your {provider_label} API Key to continue.")
         try:
             import getpass
-            key = getpass.getpass("[OpenSea] ZAI_API_KEY: ").strip()
+            key = getpass.getpass(f"[OpenSea] {env_key}: ").strip()
         except (EOFError, KeyboardInterrupt):
             print("\n[OpenSea] Key entry cancelled.")
             sys.exit(1)
 
         if not key:
-            sys.exit("[ERROR] ZAI_API_KEY is required to use OpenSea.")
+            sys.exit(f"[ERROR] {env_key} is required to use OpenSea.")
 
-        save_api_key(key)
+        save_api_key(provider, key)
 
     return key
 
@@ -834,7 +954,8 @@ def main() -> None:
             Examples:
               python3 search.py
               python3 search.py --query "lightweight MacBook for coding under £1200"
-              python3 search.py --save-key sk-xxxxxxxxxxxxxxxx
+              python3 search.py --provider z.ai --save-key sk-xxxxxxxxxxxxxxxx
+              python3 search.py --provider flock.io --save-key sk-xxxxxxxxxxxxxxxx
         """),
     )
     parser.add_argument(
@@ -848,42 +969,60 @@ def main() -> None:
         metavar="KEY",
         dest="save_key",
         default="",
-        help="Securely save a z.ai API key to runtime/.env and exit",
+        help="Securely save the selected provider API key to runtime/.env and exit",
+    )
+    parser.add_argument(
+        "--provider",
+        metavar="NAME",
+        default="",
+        help="Provider to use: z.ai or flock.io",
     )
     parser.add_argument(
         "--model",
         metavar="MODEL",
         default="",
-        help="Override the z.ai model (default: from config/defaults.json)",
+        help="Override the selected provider model (default: from config/defaults.json)",
     )
     args = parser.parse_args()
 
+    cfg = _load_config()
+    provider = resolve_provider(args.provider)
+
     # --save-key mode: just persist the key and exit
     if args.save_key:
-        save_api_key(args.save_key.strip())
+        save_api_key(provider, args.save_key.strip())
         return
 
     # Load config defaults
-    cfg = _load_config()
-    model = args.model or cfg.get("zai_model", ZAIClient.DEFAULT_MODEL)
-    base_url = os.environ.get("ZAI_API_ENDPOINT", cfg.get("zai_api_base", ZAIClient.DEFAULT_BASE))
-    timeout = int(cfg.get("request_timeout_seconds", ZAIClient.DEFAULT_TIMEOUT))
-    retry_timeout = int(cfg.get("retry_timeout_seconds", ZAIClient.DEFAULT_RETRY_TIMEOUT))
-    max_tokens = int(cfg.get("max_tokens", ZAIClient.DEFAULT_MAX_TOKENS))
-    compact_max_tokens = int(cfg.get("compact_max_tokens", ZAIClient.DEFAULT_COMPACT_MAX_TOKENS))
+    providers = _load_providers()
+    provider_models = providers.get(provider, [])
+    provider_meta = ProviderClient.PROVIDERS[provider]
+    model_key = "zai_model" if provider == "z.ai" else "flock_model"
+    base_key = "zai_api_base" if provider == "z.ai" else "flock_api_base"
+    model = args.model or cfg.get(model_key, provider_meta["default_model"])
+    base_url = os.environ.get(provider_meta["base_env"], cfg.get(base_key, provider_meta["default_base"]))
+    timeout = int(cfg.get("request_timeout_seconds", ProviderClient.DEFAULT_TIMEOUT))
+    retry_timeout = int(cfg.get("retry_timeout_seconds", ProviderClient.DEFAULT_RETRY_TIMEOUT))
+    max_tokens = int(cfg.get("max_tokens", ProviderClient.DEFAULT_MAX_TOKENS))
+    compact_max_tokens = int(cfg.get("compact_max_tokens", ProviderClient.DEFAULT_COMPACT_MAX_TOKENS))
     min_recs = int(cfg.get("min_recommendations", 3))
 
+    if provider_models and model not in provider_models:
+        supported = ", ".join(provider_models)
+        sys.exit(f"[ERROR] Model '{model}' is not allowed for {provider}. Supported models: {supported}")
+
     # ── Step 1: API key ───────────────────────────────────────────────
-    api_key = resolve_api_key()
+    api_key = resolve_api_key(provider)
 
     # ── Step 2: Questionnaire state machine ───────────────────────────
     print("\n[OpenSea] Let me help you find the best product for your needs.")
     state = StateManager(initial_prompt=args.query)
     context = state.run_questionnaire()
 
-    # ── Step 3: Call z.ai API ─────────────────────────────────────────
+    # ── Step 3: Call selected provider API ────────────────────────────
     print("\n[OpenSea] Searching for the best options... please wait.\n")
-    client = ZAIClient(
+    client = ProviderClient(
+        provider=provider,
         api_key=api_key,
         base_url=base_url,
         model=model,

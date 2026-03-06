@@ -7,5 +7,7 @@
   "max_tokens": 4096,
   "compact_max_tokens": 2048,
   "zai_api_base": "https://api.z.ai/api/paas/v4",
-  "zai_model": "glm-5"
+  "zai_model": "glm-5",
+  "flock_api_base": "https://api.flock.io/v1",
+  "flock_model": "qwen3-30b-a3b-instruct-2507"
 }

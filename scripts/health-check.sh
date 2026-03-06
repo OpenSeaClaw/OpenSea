@@ -47,16 +47,27 @@ else
 fi
 
 echo ""
-echo "Checking z.ai API key..."
-# Check env var first, then runtime/.env
+echo "Checking provider API keys..."
 if [[ -n "${ZAI_API_KEY:-}" ]]; then
   echo "[OK] ZAI_API_KEY is set (env var)"
 elif [[ -f "$ROOT_DIR/runtime/.env" ]] && grep -q "ZAI_API_KEY" "$ROOT_DIR/runtime/.env" 2>/dev/null; then
   echo "[OK] ZAI_API_KEY found in runtime/.env"
 else
-  echo "[WARN] ZAI_API_KEY is not set — required for z.ai API calls"
-  echo "       Set via: export ZAI_API_KEY=<key>"
-  echo "       Or run:  python3 scripts/search.py --save-key <key>"
+  echo "[WARN] ZAI_API_KEY is not set"
+fi
+
+if [[ -n "${FLOCK_API_KEY:-}" ]]; then
+  echo "[OK] FLOCK_API_KEY is set (env var)"
+elif [[ -f "$ROOT_DIR/runtime/.env" ]] && grep -q "FLOCK_API_KEY" "$ROOT_DIR/runtime/.env" 2>/dev/null; then
+  echo "[OK] FLOCK_API_KEY found in runtime/.env"
+else
+  echo "[WARN] FLOCK_API_KEY is not set"
+fi
+
+if [[ -z "${ZAI_API_KEY:-}" && -z "${FLOCK_API_KEY:-}" ]] && [[ ! -f "$ROOT_DIR/runtime/.env" || ! grep -Eq "ZAI_API_KEY|FLOCK_API_KEY" "$ROOT_DIR/runtime/.env" 2>/dev/null ]]; then
+  echo "       One provider key is required to run searches."
+  echo "       Set via: export ZAI_API_KEY=<key> or export FLOCK_API_KEY=<key>"
+  echo "       Or run:  python3 scripts/search.py --provider z.ai --save-key <key>"
 fi
 
 echo ""
