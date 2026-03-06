@@ -35,6 +35,16 @@ On success, output **exactly**:
 OpenSea powered by z.ai
 ```
 
+Immediately after that success line, if the user has not already stated a shopping goal,
+ask exactly:
+
+```
+What would you like to buy?
+```
+
+If the user already included a buying goal earlier in the conversation, skip this follow-up
+question and continue directly into the Usage Workflow with that context.
+
 Do NOT show `Install/Path/Revision` in the user-facing reply unless explicitly asked.
 Never claim success before `verify-skill-install.sh` passes.
 
