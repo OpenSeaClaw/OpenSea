@@ -51,7 +51,12 @@ except ImportError:
 SCRIPT_DIR = Path(__file__).resolve().parent
 ROOT_DIR = SCRIPT_DIR.parent
 ENV_FILE = ROOT_DIR / "runtime" / ".env"
-CONFIG_FILE = ROOT_DIR / "config" / "defaults.json"
+CONFIG_CANDIDATES = [
+    ROOT_DIR / "config" / "defaults.json",
+    ROOT_DIR / "skills" / "opensea" / "config" / "defaults.json",
+    ROOT_DIR.parent / "config" / "defaults.json",
+    ROOT_DIR.parent / "skills" / "opensea" / "config" / "defaults.json",
+]
 
 
 def _load_env() -> None:
@@ -62,11 +67,15 @@ def _load_env() -> None:
 
 def _load_config() -> dict[str, Any]:
     """Read defaults.json; return empty dict on failure."""
-    try:
-        with open(CONFIG_FILE) as fh:
-            return json.load(fh)
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
+    for config_file in CONFIG_CANDIDATES:
+        try:
+            with open(config_file) as fh:
+                return json.load(fh)
+        except FileNotFoundError:
+            continue
+        except json.JSONDecodeError:
+            continue
+    return {}
 
 
 # ---------------------------------------------------------------------------
@@ -310,11 +319,15 @@ class ZAIClient:
 
     DEFAULT_BASE = "https://api.z.ai/api/paas/v4"
     DEFAULT_MODEL = "glm-5"
+    DEFAULT_TIMEOUT = 90
+    DEFAULT_RETRY_TIMEOUT = 140
+    DEFAULT_MAX_TOKENS = 4096
+    DEFAULT_COMPACT_MAX_TOKENS = 2048
 
     # System prompt sent to the model – instructs it to return valid JSON
     SYSTEM_PROMPT = textwrap.dedent("""\
         You are an expert buying advisor. The user will describe what they
-        need; your job is to return 3 to 5 highly relevant product
+        need; your job is to return exactly 3 highly relevant product
         recommendations for the requested category.
 
         You MUST respond with ONLY a valid JSON object in exactly this schema
@@ -352,13 +365,23 @@ class ZAIClient:
         Rules:
         - criteria_ratings keys must exactly match the user's stated factors (lower-case).
         - Ratings are integers 1 (worst) to 5 (best) for that criterion.
-        - description must be exactly one sentence.
-        - Include 1 or 2 reddit_reviews per product with short, realistic quotes and real Reddit URLs.
-        - Include at least 2 suppliers per product, listing the cheapest options first.
+        - description must be exactly one short sentence (max 20 words).
+        - Include exactly 1 reddit_reviews item per product with a short, realistic quote and real Reddit URL.
+        - Include exactly 1 supplier per product, using the cheapest credible option first.
         - Use real, plausible UK retailers, dealers, or marketplaces appropriate to the category.
         - All prices must be in the currency implied by the user's budget.
         - Never invent URLs — use realistic, well-formed URLs for each retailer.
         - Descriptions must be grounded in actual product specs.
+    """)
+    COMPACT_SYSTEM_PROMPT = textwrap.dedent("""\
+        Return ONLY valid JSON in the required schema.
+        Hard limits:
+        - Exactly 3 recommendations.
+        - description: max 14 words.
+        - reddit_reviews: exactly 1 short item.
+        - suppliers: exactly 1 item.
+        - criteria_ratings: include at most 2 keys.
+        - No markdown, no prose outside the JSON object.
     """)
 
     def __init__(
@@ -366,12 +389,18 @@ class ZAIClient:
         api_key: str,
         base_url: str = DEFAULT_BASE,
         model: str = DEFAULT_MODEL,
-        timeout: int = 30,
+        timeout: int = DEFAULT_TIMEOUT,
+        retry_timeout: int = DEFAULT_RETRY_TIMEOUT,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
+        compact_max_tokens: int = DEFAULT_COMPACT_MAX_TOKENS,
     ) -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
         self.model = model
-        self.timeout = timeout
+        self.timeout = max(1, int(timeout))
+        self.retry_timeout = max(self.timeout, int(retry_timeout))
+        self.max_tokens = max(256, int(max_tokens))
+        self.compact_max_tokens = max(256, int(compact_max_tokens))
 
     def build_user_message(self, context: dict[str, str]) -> str:
         """
@@ -385,7 +414,7 @@ class ZAIClient:
                 f"- Request: {general_request}",
             ]
             lines.append(
-                "\nPlease provide 3 to 5 personalised product recommendations in the exact JSON schema specified."
+                "\nPlease provide exactly 3 personalised product recommendations in the exact JSON schema specified."
             )
             return "\n".join(lines)
 
@@ -404,39 +433,48 @@ class ZAIClient:
             lines.append(f"- {label}: {value}")
 
         lines.append(
-            "\nPlease provide 3 to 5 personalised product recommendations in the exact JSON schema specified."
+            "\nPlease provide exactly 3 personalised product recommendations in the exact JSON schema specified."
         )
         return "\n".join(lines)
 
-    def fetch_recommendations(self, context: dict[str, str]) -> list[dict[str, Any]]:
-        """
-        Send the chat-completion request and return the parsed recommendations list.
-        Raises RuntimeError with a user-friendly message on failure.
-        """
+    def _build_payload(self, user_message: str, *, compact_mode: bool) -> dict[str, Any]:
+        """Build a normal or compact completion payload."""
+        system_prompt = self.COMPACT_SYSTEM_PROMPT if compact_mode else self.SYSTEM_PROMPT
+        token_budget = self.compact_max_tokens if compact_mode else self.max_tokens
+        return {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_message},
+            ],
+            "stream": False,
+            "temperature": 0.2,
+            "max_tokens": token_budget,
+        }
+
+    def _request_completion(
+        self,
+        user_message: str,
+        *,
+        compact_mode: bool,
+        timeout: int,
+    ) -> tuple[str, str]:
+        """Send one completion request and return content plus finish reason."""
         url = f"{self.base_url}/chat/completions"
         headers = {
             "Accept-Language": "en-US,en",
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
         }
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user", "content": self.build_user_message(context)},
-            ],
-            "stream": False,
-            "temperature": 0.3,   # Low temperature for factual, consistent results
-            "max_tokens": 4096,
-        }
+        payload = self._build_payload(user_message, compact_mode=compact_mode)
 
         try:
-            resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
-        except requests.exceptions.Timeout:
-            raise RuntimeError(
-                f"[ERROR] Request to z.ai timed out after {self.timeout}s. "
+            resp = requests.post(url, headers=headers, json=payload, timeout=timeout)
+        except requests.exceptions.Timeout as exc:
+            raise TimeoutError(
+                f"[ERROR] Request to z.ai timed out after {timeout}s. "
                 "Check your internet connection or increase request_timeout_seconds in config/defaults.json."
-            )
+            ) from exc
         except requests.exceptions.ConnectionError as exc:
             raise RuntimeError(f"[ERROR] Could not connect to z.ai API: {exc}")
 
@@ -455,18 +493,92 @@ class ZAIClient:
                 f"[ERROR] z.ai API returned HTTP {resp.status_code}: {resp.text[:300]}"
             )
 
-        # Extract content from the chat-completion response
         try:
             resp_data = resp.json()
-            content = resp_data["choices"][0]["message"]["content"].strip()
-        except (KeyError, IndexError, json.JSONDecodeError) as exc:
+            choice = resp_data["choices"][0]
+            content = choice["message"]["content"].strip()
+            finish_reason = str(choice.get("finish_reason", "")).strip().lower()
+        except (KeyError, IndexError, AttributeError, json.JSONDecodeError) as exc:
             raise RuntimeError(
                 f"[ERROR] Unexpected z.ai response structure: {exc}\n"
                 f"Raw response: {resp.text[:500]}"
             )
+        return content, finish_reason
 
-        # Parse the JSON the model returned
-        return self._parse_model_json(content)
+    def _request_with_timeout_retry(
+        self,
+        user_message: str,
+        *,
+        compact_mode: bool,
+    ) -> tuple[str, str]:
+        """Retry once with a longer timeout if the first request times out."""
+        timeouts = [self.timeout]
+        if self.retry_timeout > self.timeout:
+            timeouts.append(self.retry_timeout)
+        if compact_mode and self.retry_timeout > self.timeout:
+            timeouts = [self.retry_timeout]
+
+        last_timeout_error: TimeoutError | None = None
+        for idx, timeout in enumerate(timeouts):
+            try:
+                return self._request_completion(
+                    user_message,
+                    compact_mode=compact_mode,
+                    timeout=timeout,
+                )
+            except TimeoutError as exc:
+                last_timeout_error = exc
+                if idx < len(timeouts) - 1:
+                    print(
+                        f"[WARN] Request timed out at {timeout}s; retrying with {timeouts[idx + 1]}s..."
+                    )
+                    continue
+                break
+
+        if last_timeout_error is not None:
+            raise RuntimeError(str(last_timeout_error))
+        raise RuntimeError("[ERROR] Request failed before completion.")
+
+    def fetch_recommendations(self, context: dict[str, str]) -> list[dict[str, Any]]:
+        """
+        Fetch recommendations with timeout retry and compact fallback.
+        """
+        user_message = self.build_user_message(context)
+
+        content, finish_reason = self._request_with_timeout_retry(
+            user_message,
+            compact_mode=False,
+        )
+
+        parse_error: RuntimeError | None = None
+        try:
+            recommendations = self._parse_model_json(content)
+        except RuntimeError as exc:
+            parse_error = exc
+            recommendations = []
+
+        if finish_reason == "length" or parse_error is not None:
+            if finish_reason == "length":
+                print("[WARN] Model response was truncated (finish_reason=length). Retrying in compact mode...")
+            else:
+                print("[WARN] Model returned invalid JSON. Retrying in compact mode...")
+
+            compact_content, _ = self._request_with_timeout_retry(
+                user_message,
+                compact_mode=True,
+            )
+            try:
+                return self._parse_model_json(compact_content)
+            except RuntimeError as compact_error:
+                if parse_error is not None:
+                    raise RuntimeError(
+                        f"{parse_error}\n[ERROR] Compact retry failed: {compact_error}"
+                    )
+                raise RuntimeError(
+                    f"[ERROR] Compact retry failed after truncated response: {compact_error}"
+                )
+
+        return recommendations
 
     @staticmethod
     def _parse_model_json(content: str) -> list[dict[str, Any]]:
@@ -755,7 +867,10 @@ def main() -> None:
     cfg = _load_config()
     model = args.model or cfg.get("zai_model", ZAIClient.DEFAULT_MODEL)
     base_url = os.environ.get("ZAI_API_ENDPOINT", cfg.get("zai_api_base", ZAIClient.DEFAULT_BASE))
-    timeout = int(cfg.get("request_timeout_seconds", 30))
+    timeout = int(cfg.get("request_timeout_seconds", ZAIClient.DEFAULT_TIMEOUT))
+    retry_timeout = int(cfg.get("retry_timeout_seconds", ZAIClient.DEFAULT_RETRY_TIMEOUT))
+    max_tokens = int(cfg.get("max_tokens", ZAIClient.DEFAULT_MAX_TOKENS))
+    compact_max_tokens = int(cfg.get("compact_max_tokens", ZAIClient.DEFAULT_COMPACT_MAX_TOKENS))
     min_recs = int(cfg.get("min_recommendations", 3))
 
     # ── Step 1: API key ───────────────────────────────────────────────
@@ -768,7 +883,15 @@ def main() -> None:
 
     # ── Step 3: Call z.ai API ─────────────────────────────────────────
     print("\n[OpenSea] Searching for the best options... please wait.\n")
-    client = ZAIClient(api_key=api_key, base_url=base_url, model=model, timeout=timeout)
+    client = ZAIClient(
+        api_key=api_key,
+        base_url=base_url,
+        model=model,
+        timeout=timeout,
+        retry_timeout=retry_timeout,
+        max_tokens=max_tokens,
+        compact_max_tokens=compact_max_tokens,
+    )
 
     try:
         recommendations = client.fetch_recommendations(context)

@@ -2,7 +2,10 @@
   "max_recommendations": 5,
   "min_recommendations": 3,
   "currency": "GBP",
-  "request_timeout_seconds": 30,
+  "request_timeout_seconds": 90,
+  "retry_timeout_seconds": 140,
+  "max_tokens": 4096,
+  "compact_max_tokens": 2048,
   "zai_api_base": "https://api.z.ai/api/paas/v4",
   "zai_model": "glm-5"
 }
